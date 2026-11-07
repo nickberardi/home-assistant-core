@@ -695,7 +695,6 @@ async def test_statistics_poll_between_device_polls(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
     mock_network_requests: Callable[[], None],
-    freezer: FrozenDateTimeFactory,
 ) -> None:
     """Device polls in between do not hold statistics back."""
     aioclient_mock.clear_requests()
@@ -704,10 +703,10 @@ async def test_statistics_poll_between_device_polls(
         json={**SWITCH_STATISTICS, "cpuUtilizationPct": 50.0},
     )
     mock_network_requests()
-    for _ in range(7):
-        freezer.tick(timedelta(seconds=10))
-        async_fire_time_changed(hass)
-        await hass.async_block_till_done()
+    # A device poll in between must not move the statistics poll due at 60 s
+    for seconds in (11, 61):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds))
+        await hass.async_block_till_done(wait_background_tasks=True)
 
     assert hass.states.get("sensor.switch_cpu_utilization").state == "50.0"
 
