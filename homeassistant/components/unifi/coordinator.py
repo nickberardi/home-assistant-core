@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, override
 import aiounifi
 from aiounifi import EndpointNotFound
 from aiounifi.interfaces.api_handlers import APIHandler, ItemEvent
+from aiounifi.network.v1.interfaces.api_handlers import APIHandler as NetworkApiHandler
 
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -38,7 +39,17 @@ SESSION_CHECK_ERRORS = (
 )
 
 
-class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
+# An Integration API key is rejected on every endpoint alike
+API_KEY_SESSION_CHECK_ERRORS = (
+    *SESSION_CHECK_ERRORS,
+    aiounifi.Forbidden,
+    aiounifi.Unauthorized,
+)
+
+type UnifiApiHandler = APIHandler | NetworkApiHandler
+
+
+class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
     DataUpdateCoordinator[tuple[ItemEvent, str] | None]
 ):
     """Coordinator managing websocket or polling updates for a UniFi API handler."""
@@ -49,15 +60,30 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
         handler: HandlerT,
         *,
         disable_polling_on_endpoint_not_found: bool = False,
+        update_interval: timedelta | None = None,
     ) -> None:
-        """Initialize coordinator."""
-        supports_websocket = bool(handler.process_messages or handler.remove_messages)
+        """Initialize coordinator.
+
+        A fixed update interval is kept whether the handler has items or not.
+        """
+        supports_websocket = bool(
+            getattr(handler, "process_messages", None)
+            or getattr(handler, "remove_messages", None)
+        )
         super().__init__(
             hub.hass,
             LOGGER,
             name=f"UniFi {type(handler).__name__}",
             config_entry=hub.config.entry,
-            update_interval=None if supports_websocket else POLL_INTERVAL,
+            update_interval=(
+                None if supports_websocket else update_interval or POLL_INTERVAL
+            ),
+        )
+        self._fixed_update_interval = update_interval is not None
+        self._session_check_errors = (
+            API_KEY_SESSION_CHECK_ERRORS
+            if hub.config.api_key_only
+            else SESSION_CHECK_ERRORS
         )
         self._handler = handler
         self._supports_websocket = supports_websocket
@@ -98,7 +124,7 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
                     type(self._handler).__name__,
                 )
             raise UpdateFailed(str(err)) from err
-        except SESSION_CHECK_ERRORS as err:
+        except self._session_check_errors as err:
             self._connection.verify_session(err)
             raise UpdateFailed(str(err) or type(err).__name__) from err
         except aiounifi.AiounifiException as err:
@@ -106,7 +132,7 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
                 raise UpdateFailed(str(err)) from err
             self.logger.warning("Error fetching %s data: %s", self.name, err)
 
-        if self.update_interval is not None:
+        if self.update_interval is not None and not self._fixed_update_interval:
             self.update_interval = (
                 POLL_INTERVAL if self._handler.items() else IDLE_POLL_INTERVAL
             )

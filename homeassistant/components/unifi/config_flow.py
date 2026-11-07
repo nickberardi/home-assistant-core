@@ -7,16 +7,17 @@ Configuration of options through options flow.
 """
 
 import asyncio
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import json
 import operator
 import socket
 from types import MappingProxyType
-from typing import Any, override
+from typing import Any, NamedTuple, override
 
 import aiounifi
 from aiounifi.interfaces.sites import Sites
+from aiounifi.network.v1.interfaces.sites import Sites as NetworkSites
 import probatio
 
 from homeassistant.config_entries import (
@@ -27,6 +28,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.const import (
+    CONF_API_KEY,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
@@ -45,6 +47,7 @@ from .const import (
     CONF_ALLOW_UPTIME_SENSORS,
     CONF_BLOCK_CLIENT,
     CONF_CLIENT_SOURCE,
+    CONF_CONNECTION_MODE,
     CONF_DETECTION_TIME,
     CONF_DPI_RESTRICTIONS,
     CONF_IGNORE_LOCAL_MAC,
@@ -55,12 +58,19 @@ from .const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_DEVICES,
     CONF_TRACK_WIRED_CLIENTS,
+    CONNECTION_MODE_API_KEY_ONLY,
     DEFAULT_DPI_RESTRICTIONS,
     DOMAIN,
     LOGGER,
 )
-from .errors import AuthenticationRequired, CannotConnect, MfaRequired
+from .errors import (
+    AuthenticationRequired,
+    CannotConnect,
+    MfaRequired,
+    NetworkApiUnavailable,
+)
 from .hub import UnifiHub, get_unifi_api
+from .hub.config import entry_is_api_key_only
 
 DEFAULT_HOST = "unifi"
 DEFAULT_PORT = 443
@@ -68,13 +78,24 @@ DEFAULT_SITE_ID = "default"
 DEFAULT_VERIFY_SSL = False
 SITE_REQUEST_TIMEOUT = 10
 
+API_KEY_DOCUMENTATION_URL = "https://www.home-assistant.io/integrations/unifi/#api-key"
+
+
+class SiteChoice(NamedTuple):
+    """A site to set up."""
+
+    name: str
+    """Short name of the site, the same in both APIs."""
+    title: str
+    """Display name of the site."""
+
 
 class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a UniFi Network config flow."""
 
     VERSION = 1
 
-    sites: Sites
+    sites: dict[str, SiteChoice]
 
     @staticmethod
     @callback
@@ -94,7 +115,13 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle a flow initialized by the user."""
+        """Let the user pick how to connect: a local user or an API key."""
+        return self.async_show_menu(step_id="user", menu_options=["full", "api_key"])
+
+    async def async_step_full(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Connect with a local user."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -110,20 +137,47 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
                 self.sites = await self._async_update_sites(self.config)
                 return await self.async_step_site()
         else:
-            host = self.config.get(CONF_HOST)
-            if not host:
-                host = await _async_discover_unifi(self.hass)
-            if not host:
-                host = DEFAULT_HOST
             data_schema = self._build_form_schema(
-                host=host,
+                host=await self._async_default_host(),
                 verify_ssl=self.config.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
             )
 
         return self.async_show_form(
-            step_id="user",
+            step_id="full",
             data_schema=data_schema,
             errors=errors,
+        )
+
+    async def async_step_api_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Connect with only an API key of the Integration API."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self.config = _api_key_config_from_input(user_input)
+            data_schema = self._build_api_key_schema(
+                self.config[CONF_HOST],
+                self.config[CONF_PORT],
+                self.config[CONF_VERIFY_SSL],
+            )
+
+            with _catch_unifi_api_flow_errors(errors):
+                self.sites = await self._async_update_network_sites(self.config)
+                return await self.async_step_site()
+        else:
+            data_schema = self._build_api_key_schema(
+                host=await self._async_default_host(),
+                verify_ssl=self.config.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL),
+            )
+
+        return self.async_show_form(
+            step_id="api_key",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "api_key_documentation_url": API_KEY_DOCUMENTATION_URL
+            },
         )
 
     async def async_step_site(
@@ -132,18 +186,23 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         """Select site to control."""
         if user_input is not None:
             unique_id = user_input[CONF_SITE_ID]
-            self.config[CONF_SITE_ID] = self.sites[unique_id].name
+            site = self.sites[unique_id]
+            self.config[CONF_SITE_ID] = site.name
 
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
+            # An entry of a console older than UniFi Network 11 keys the
+            # same site by its ObjectId
+            self._async_abort_entries_match(
+                {CONF_HOST: self.config[CONF_HOST], CONF_SITE_ID: site.name}
+            )
 
-            site_nice_name = self.sites[unique_id].description
-            return self.async_create_entry(title=site_nice_name, data=self.config)
+            return self.async_create_entry(title=site.title, data=self.config)
 
-        if len(self.sites.values()) == 1:
+        if len(self.sites) == 1:
             return await self.async_step_site({CONF_SITE_ID: next(iter(self.sites))})
 
-        site_names = {site.site_id: site.description for site in self.sites.values()}
+        site_names = {site_id: site.title for site_id, site in self.sites.items()}
         return self.async_show_form(
             step_id="site",
             data_schema=probatio.Schema(
@@ -154,19 +213,60 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
-        """Trigger a reauthentication flow."""
+        """Trigger a reauthentication flow.
+
+        Only the credentials of the current mode are renewed, switching the
+        mode belongs to reconfigure.
+        """
         reauth_entry = self._get_reauth_entry()
         self.context["title_placeholders"] = {
             "host": reauth_entry.data[CONF_HOST],
             "name": reauth_entry.title,
         }
 
-        return await self.async_step_reconfigure()
+        if entry_is_api_key_only(entry_data):
+            return await self.async_step_reauth_api_key()
+        return await self.async_step_reconfigure_full()
+
+    async def async_step_reauth_api_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Renew the API key."""
+        reauth_entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            data = {**reauth_entry.data, CONF_API_KEY: user_input[CONF_API_KEY]}
+            with _catch_unifi_api_flow_errors(errors):
+                await get_unifi_api(self.hass, MappingProxyType(data))
+                return self.async_update_reload_and_abort(reauth_entry, data=data)
+
+        return self.async_show_form(
+            step_id="reauth_api_key",
+            data_schema=probatio.Schema(
+                {probatio.Required(probatio.Secret(CONF_API_KEY)): str}
+            ),
+            errors=errors,
+            description_placeholders={
+                "api_key_documentation_url": API_KEY_DOCUMENTATION_URL,
+                "host": reauth_entry.data[CONF_HOST],
+                "name": reauth_entry.title,
+            },
+        )
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle a reconfiguration flow."""
+        """Let the user pick how to connect: a local user or an API key."""
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["reconfigure_full", "reconfigure_api_key"],
+        )
+
+    async def async_step_reconfigure_full(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Connect with a local user, a stored API key is kept."""
         config_entry = self._get_reauth_or_reconfigure_entry()
         errors: dict[str, str] = {}
 
@@ -181,36 +281,99 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
 
             with _catch_unifi_api_flow_errors(errors):
                 sites = await self._async_update_sites(config_data)
-
-                if (
-                    (unique_id := config_entry.unique_id) is not None
-                ) and unique_id in sites:
-                    config_data[CONF_SITE_ID] = sites[unique_id].name
-                    if config_entry.state is ConfigEntryState.LOADED:
-                        # The update listener reloads a loaded entry on data changes
-                        if config_data.items() <= config_entry.data.items():
-                            self.hass.config_entries.async_schedule_reload(
-                                config_entry.entry_id
-                            )
-                        return self.async_update_and_abort(
-                            config_entry, data_updates=config_data
-                        )
-                    return self.async_update_reload_and_abort(
-                        config_entry, data_updates=config_data
-                    )
-                raise AbortFlow("unknown_site_id")
+                return self._async_update_entry(config_entry, config_data, sites)
         else:
             data_schema = self._build_form_schema(
                 config_entry.data[CONF_HOST],
-                config_entry.data[CONF_USERNAME],
+                config_entry.data.get(CONF_USERNAME, ""),
                 config_entry.data[CONF_PORT],
                 config_entry.data[CONF_VERIFY_SSL],
             )
 
         return self.async_show_form(
-            step_id="reconfigure",
+            step_id="reconfigure_full",
             data_schema=data_schema,
             errors=errors,
+        )
+
+    async def async_step_reconfigure_api_key(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Connect with only an API key, stored local user credentials are kept."""
+        config_entry = self._get_reconfigure_entry()
+        stored_api_key = config_entry.data.get(CONF_API_KEY)
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            config_data = _api_key_config_from_input(
+                {CONF_API_KEY: stored_api_key, **user_input}
+            )
+            data_schema = self._build_api_key_schema(
+                config_data[CONF_HOST],
+                config_data[CONF_PORT],
+                config_data[CONF_VERIFY_SSL],
+                api_key_optional=stored_api_key is not None,
+            )
+
+            with _catch_unifi_api_flow_errors(errors):
+                sites = await self._async_update_network_sites(config_data)
+                return self._async_update_entry(config_entry, config_data, sites)
+        else:
+            data_schema = self._build_api_key_schema(
+                config_entry.data[CONF_HOST],
+                config_entry.data[CONF_PORT],
+                config_entry.data[CONF_VERIFY_SSL],
+                api_key_optional=stored_api_key is not None,
+            )
+
+        return self.async_show_form(
+            step_id="reconfigure_api_key",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "api_key_documentation_url": API_KEY_DOCUMENTATION_URL
+            },
+        )
+
+    @callback
+    def _async_update_entry(
+        self,
+        config_entry: UnifiConfigEntry,
+        config_data: dict[str, Any],
+        sites: dict[str, SiteChoice],
+    ) -> ConfigFlowResult:
+        """Store validated connection data and the site it resolves to.
+
+        The site is matched by unique ID, or by name when the other API keys
+        it differently, which then becomes the unique ID.
+        """
+        unique_id = config_entry.unique_id
+        if unique_id not in sites:
+            unique_id = next(
+                (
+                    site_id
+                    for site_id, site in sites.items()
+                    if site.name == config_entry.data[CONF_SITE_ID]
+                ),
+                None,
+            )
+        if unique_id is None:
+            raise AbortFlow("unknown_site_id")
+
+        # Credentials of the other mode are kept, so switching back is lossless
+        data = {**config_entry.data, **config_data, CONF_SITE_ID: sites[unique_id].name}
+        if not entry_is_api_key_only(config_data):
+            data.pop(CONF_CONNECTION_MODE, None)
+
+        if config_entry.state is ConfigEntryState.LOADED:
+            # The update listener reloads a loaded entry on data changes
+            if data == config_entry.data:
+                self.hass.config_entries.async_schedule_reload(config_entry.entry_id)
+            return self.async_update_and_abort(
+                config_entry, unique_id=unique_id, data=data
+            )
+        return self.async_update_reload_and_abort(
+            config_entry, unique_id=unique_id, data=data
         )
 
     @override
@@ -250,7 +413,9 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
             self.hass.config_entries.async_loaded_entries(DOMAIN)
         )
         if any(
-            mac_address in entry.runtime_data.api.devices for entry in loaded_entries
+            mac_address in entry.runtime_data.api.devices
+            or mac_address in entry.runtime_data.api.network.devices
+            for entry in loaded_entries
         ):
             return self.async_abort(reason="already_configured")
 
@@ -274,51 +439,71 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         port: int = DEFAULT_PORT,
         verify_ssl: bool = DEFAULT_VERIFY_SSL,
     ) -> probatio.Schema:
+        """Build the form of a local user."""
         return probatio.Schema(
             {
                 probatio.Required(CONF_HOST, default=host): str,
                 probatio.Required(CONF_USERNAME, default=username): str,
                 probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
                 probatio.Optional(CONF_PORT, default=port): int,
-                probatio.Optional(
-                    CONF_VERIFY_SSL,
-                    default=verify_ssl,
-                ): bool,
+                probatio.Optional(CONF_VERIFY_SSL, default=verify_ssl): bool,
             }
         )
 
-    async def _async_update_sites(self, data: Mapping[str, Any]) -> Sites:
+    def _build_api_key_schema(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        verify_ssl: bool = DEFAULT_VERIFY_SSL,
+        *,
+        api_key_optional: bool = False,
+    ) -> probatio.Schema:
+        """Build the form of an API key, an optional key keeps the stored one."""
+        api_key_marker = probatio.Optional if api_key_optional else probatio.Required
+        return probatio.Schema(
+            {
+                probatio.Required(CONF_HOST, default=host): str,
+                api_key_marker(probatio.Secret(CONF_API_KEY)): str,
+                probatio.Optional(CONF_PORT, default=port): int,
+                probatio.Optional(CONF_VERIFY_SSL, default=verify_ssl): bool,
+            }
+        )
+
+    async def _async_default_host(self) -> str:
+        """Return the discovered host, or the address the name unifi has."""
+        host: str | None = self.config.get(CONF_HOST)
+        if host:
+            return host
+        return await _async_discover_unifi(self.hass) or DEFAULT_HOST
+
+    async def _async_update_sites(
+        self, data: Mapping[str, Any]
+    ) -> dict[str, SiteChoice]:
         """Get updated sites through UniFi API."""
         hub = await get_unifi_api(self.hass, MappingProxyType(data))
-        try:
-            async with asyncio.timeout(SITE_REQUEST_TIMEOUT):
-                await hub.sites.update()
-        except (
-            aiounifi.Forbidden,
-            aiounifi.LoginRequired,
-            aiounifi.NoPermission,
-            aiounifi.Unauthorized,
-        ) as err:
-            LOGGER.warning(
-                "UniFi Network at %s rejected the site request: %s",
-                data[CONF_HOST],
-                type(err).__name__,
-            )
-            raise AuthenticationRequired from err
-        # aiounifi 97 does not wrap JSON decode errors, newer releases do
-        except (TimeoutError, json.JSONDecodeError, aiounifi.AiounifiException) as err:
-            LOGGER.warning(
-                "Error fetching sites from UniFi Network at %s: %r",
-                data[CONF_HOST],
-                err,
-            )
-            raise CannotConnect from err
-        if not hub.sites.values():
-            # aiounifi 97 returns no sites when the console answers with HTML,
-            # as it does while the Network application is missing or starting
-            LOGGER.warning("No sites found on UniFi Network at %s", data[CONF_HOST])
-            raise CannotConnect
-        return hub.sites
+        return await _async_fetch_sites(
+            data,
+            hub.sites,
+            lambda: {
+                site.site_id: SiteChoice(site.name, site.description)
+                for site in hub.sites.values()
+            },
+        )
+
+    async def _async_update_network_sites(
+        self, data: Mapping[str, Any]
+    ) -> dict[str, SiteChoice]:
+        """Get updated sites through the Integration API."""
+        hub = await get_unifi_api(self.hass, MappingProxyType(data))
+        sites = hub.network.sites
+        return await _async_fetch_sites(
+            data,
+            sites,
+            lambda: {
+                site.site_id: SiteChoice(site.internal_reference, site.name)
+                for site in sites.values()
+            },
+        )
 
     @callback
     def _get_reauth_or_reconfigure_entry(self) -> UnifiConfigEntry:
@@ -349,6 +534,9 @@ class UnifiOptionsFlowHandler(OptionsFlow):
             user_input.update(more_options)
             self.options.update(user_input)
             return self.async_create_entry(title="", data=self.options)
+
+        if self.hub.config.api_key_only:
+            return self._async_show_network_api_form()
 
         clients_to_block = {}
         for client in self.hub.api.clients.values():
@@ -468,6 +656,46 @@ class UnifiOptionsFlowHandler(OptionsFlow):
             last_step=True,
         )
 
+    @callback
+    def _async_show_network_api_form(self) -> ConfigFlowResult:
+        """Show the options the Integration API supports."""
+        config = self.hub.config
+        return self.async_show_form(
+            step_id="init",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Optional(
+                        CONF_TRACK_CLIENTS, default=config.option_track_clients
+                    ): bool,
+                    probatio.Optional(
+                        CONF_TRACK_DEVICES, default=config.option_track_devices
+                    ): bool,
+                    probatio.Required(CONF_MORE_OPTIONS): section(
+                        probatio.Schema(
+                            {
+                                probatio.Optional(
+                                    CONF_TRACK_WIRED_CLIENTS,
+                                    default=config.option_track_wired_clients,
+                                ): bool,
+                                probatio.Optional(
+                                    CONF_DETECTION_TIME,
+                                    default=int(
+                                        config.option_detection_time.total_seconds()
+                                    ),
+                                ): int,
+                                probatio.Optional(
+                                    CONF_IGNORE_LOCAL_MAC,
+                                    default=config.option_ignore_local_mac,
+                                ): bool,
+                            }
+                        ),
+                        SectionConfig(collapsed=True),
+                    ),
+                }
+            ),
+            last_step=True,
+        )
+
 
 async def _async_discover_unifi(hass: HomeAssistant) -> str | None:
     """Discover UniFi Network address."""
@@ -475,6 +703,55 @@ async def _async_discover_unifi(hass: HomeAssistant) -> str | None:
         return await hass.async_add_executor_job(socket.gethostbyname, "unifi")
     except socket.gaierror:
         return None
+
+
+async def _async_fetch_sites(
+    data: Mapping[str, Any],
+    sites: Sites | NetworkSites,
+    site_choices: Callable[[], dict[str, SiteChoice]],
+) -> dict[str, SiteChoice]:
+    """Fetch the sites of the console and return the ones to choose from."""
+    try:
+        async with asyncio.timeout(SITE_REQUEST_TIMEOUT):
+            await sites.update()
+    except (
+        aiounifi.Forbidden,
+        aiounifi.LoginRequired,
+        aiounifi.NoPermission,
+        aiounifi.Unauthorized,
+    ) as err:
+        LOGGER.warning(
+            "UniFi Network at %s rejected the site request: %s",
+            data[CONF_HOST],
+            type(err).__name__,
+        )
+        raise AuthenticationRequired from err
+    # aiounifi 97 does not wrap JSON decode errors, newer releases do
+    except (TimeoutError, json.JSONDecodeError, aiounifi.AiounifiException) as err:
+        LOGGER.warning(
+            "Error fetching sites from UniFi Network at %s: %r",
+            data[CONF_HOST],
+            err,
+        )
+        raise CannotConnect from err
+    if not (choices := site_choices()):
+        # aiounifi 97 returns no sites when the console answers with HTML,
+        # as it does while the Network application is missing or starting
+        LOGGER.warning("No sites found on UniFi Network at %s", data[CONF_HOST])
+        raise CannotConnect
+    return choices
+
+
+def _api_key_config_from_input(user_input: dict[str, Any]) -> dict[str, Any]:
+    """Build config entry data of an API key from user input."""
+    return {
+        CONF_HOST: user_input[CONF_HOST],
+        CONF_API_KEY: user_input[CONF_API_KEY],
+        CONF_PORT: user_input.get(CONF_PORT),
+        CONF_VERIFY_SSL: user_input.get(CONF_VERIFY_SSL),
+        CONF_SITE_ID: DEFAULT_SITE_ID,
+        CONF_CONNECTION_MODE: CONNECTION_MODE_API_KEY_ONLY,
+    }
 
 
 def _config_from_input(user_input: dict[str, Any]) -> dict[str, Any]:
@@ -498,5 +775,7 @@ def _catch_unifi_api_flow_errors(errors: dict[str, str]) -> Iterator[None]:
         errors["base"] = "mfa_required"
     except AuthenticationRequired:
         errors["base"] = "faulty_credentials"
+    except NetworkApiUnavailable:
+        errors["base"] = "network_api_unavailable"
     except CannotConnect:
         errors["base"] = "service_unavailable"
