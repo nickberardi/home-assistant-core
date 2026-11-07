@@ -49,6 +49,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import format_mac
 
 from .conftest import (
@@ -58,6 +59,7 @@ from .conftest import (
     NETWORK_API_KEY,
     NETWORK_SITE_ID,
     NETWORK_URL,
+    ConfigEntryFactoryType,
     network_page,
 )
 
@@ -1231,14 +1233,25 @@ async def test_reauth_api_key(
     }
 
 
+SITE_OBJECT_ID = "5ba29dd4e3c58f026e9d7c38"
+OBJECT_ID_SITE_PAYLOAD = [
+    {"desc": "Site name", "name": DEFAULT_SITE, "role": "admin", "_id": SITE_OBJECT_ID}
+]
+
+
+@pytest.mark.parametrize("site_payload", [OBJECT_ID_SITE_PAYLOAD])
 async def test_reconfigure_to_api_key(
     hass: HomeAssistant,
-    config_entry_setup: MockConfigEntry,
+    device_registry: dr.DeviceRegistry,
+    config_entry: MockConfigEntry,
+    config_entry_factory: ConfigEntryFactoryType,
     mock_network_requests: Callable[[], None],
 ) -> None:
     """Test switching to an API key keeps the local user for switching back."""
+    hass.config_entries.async_update_entry(config_entry, unique_id=SITE_OBJECT_ID)
+    await config_entry_factory()
     mock_network_requests()
-    result = await config_entry_setup.start_reconfigure_flow(hass)
+    result = await config_entry.start_reconfigure_flow(hass)
     result = await _select_menu(hass, result, "reconfigure_api_key")
 
     assert result["type"] is FlowResultType.FORM
@@ -1251,18 +1264,26 @@ async def test_reconfigure_to_api_key(
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
-    assert config_entry_setup.data == {
+    assert config_entry.data == {
         **API_KEY_ENTRY_DATA,
         CONF_USERNAME: "username",
         CONF_PASSWORD: "password",
     }
-    # The Integration API keys sites by UUID
-    assert config_entry_setup.unique_id == NETWORK_SITE_ID
-    assert config_entry_setup.state is ConfigEntryState.LOADED
+    # The Integration API keys the site of an older console by UUID
+    assert config_entry.unique_id == NETWORK_SITE_ID
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert device_registry.async_get_device_by_identifier(
+        (DOMAIN, NETWORK_SITE_ID), config_entry.entry_id
+    )
+    assert not device_registry.async_get_device_by_identifier(
+        (DOMAIN, SITE_OBJECT_ID), config_entry.entry_id
+    )
 
 
+@pytest.mark.parametrize("site_payload", [OBJECT_ID_SITE_PAYLOAD])
 async def test_reconfigure_to_local_user(
     hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
     network_config_entry_setup: MockConfigEntry,
     mock_requests: Callable[[str, str], None],
 ) -> None:
@@ -1283,8 +1304,52 @@ async def test_reconfigure_to_local_user(
         CONF_API_KEY: NETWORK_API_KEY,
         CONF_SITE_ID: DEFAULT_SITE,
     }
-    assert network_config_entry_setup.unique_id == "1"
+    assert network_config_entry_setup.unique_id == SITE_OBJECT_ID
     assert network_config_entry_setup.state is ConfigEntryState.LOADED
+    assert device_registry.async_get_device_by_identifier(
+        (DOMAIN, SITE_OBJECT_ID), network_config_entry_setup.entry_id
+    )
+
+
+@pytest.mark.parametrize("site_payload", [OBJECT_ID_SITE_PAYLOAD])
+async def test_reconfigure_mode_on_other_console(
+    hass: HomeAssistant,
+    network_config_entry_setup: MockConfigEntry,
+    mock_requests: Callable[[str, str], None],
+) -> None:
+    """Test a site of the same name on another console is not taken over."""
+    mock_requests("5.6.7.8", DEFAULT_SITE)
+    result = await network_config_entry_setup.start_reconfigure_flow(hass)
+    result = await _select_menu(hass, result, "reconfigure_full")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={**LOCAL_USER_INPUT, CONF_HOST: "5.6.7.8"}
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unknown_site_id"
+    assert network_config_entry_setup.unique_id == NETWORK_SITE_ID
+
+
+@pytest.mark.parametrize("site_payload", [OBJECT_ID_SITE_PAYLOAD])
+async def test_reconfigure_mode_to_configured_site(
+    hass: HomeAssistant,
+    network_config_entry_setup: MockConfigEntry,
+    mock_requests: Callable[[str, str], None],
+) -> None:
+    """Test the site an other entry has is not taken over."""
+    MockConfigEntry(domain=DOMAIN, unique_id=SITE_OBJECT_ID).add_to_hass(hass)
+    mock_requests(DEFAULT_HOST, DEFAULT_SITE)
+    result = await network_config_entry_setup.start_reconfigure_flow(hass)
+    result = await _select_menu(hass, result, "reconfigure_full")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=LOCAL_USER_INPUT
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert network_config_entry_setup.unique_id == NETWORK_SITE_ID
 
 
 async def test_reconfigure_api_key_keeps_stored_key(

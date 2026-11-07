@@ -368,9 +368,6 @@ async def fixture_config_entry_setup(
     return await config_entry_factory()
 
 
-# Integration API fixtures
-
-
 @pytest.fixture(name="network_config_entry")
 def fixture_network_config_entry(
     hass: HomeAssistant, config_entry_options: MappingProxyType[str, Any]

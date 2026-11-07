@@ -69,7 +69,7 @@ from .errors import (
     MfaRequired,
     NetworkApiUnavailable,
 )
-from .hub import UnifiHub, get_unifi_api
+from .hub import UnifiHub, async_move_site_devices, get_unifi_api, site_ids_moved
 from .hub.config import entry_is_api_key_only
 
 DEFAULT_HOST = "unifi"
@@ -347,18 +347,15 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         The site is matched by unique ID, or by name when the other API keys
         it differently, which then becomes the unique ID.
         """
-        unique_id = config_entry.unique_id
+        old_id = config_entry.unique_id
+        assert old_id is not None
+        unique_id: str | None = old_id
         if unique_id not in sites:
-            unique_id = next(
-                (
-                    site_id
-                    for site_id, site in sites.items()
-                    if site.name == config_entry.data[CONF_SITE_ID]
-                ),
-                None,
-            )
+            unique_id = self._async_match_moved_site(config_entry, config_data, sites)
         if unique_id is None:
             raise AbortFlow("unknown_site_id")
+        if unique_id != old_id:
+            async_move_site_devices(self.hass, config_entry.entry_id, old_id, unique_id)
 
         # Credentials of the other mode are kept, so switching back is lossless
         data = {**config_entry.data, **config_data, CONF_SITE_ID: sites[unique_id].name}
@@ -375,6 +372,39 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         return self.async_update_reload_and_abort(
             config_entry, unique_id=unique_id, data=data
         )
+
+    @callback
+    def _async_match_moved_site(
+        self,
+        config_entry: UnifiConfigEntry,
+        config_data: dict[str, Any],
+        sites: dict[str, SiteChoice],
+    ) -> str | None:
+        """Find the site of the entry in the API that keys it differently.
+
+        Only on the same host, as nearly every console has a site of the
+        same name.
+        """
+        if config_data[CONF_HOST] != config_entry.data[CONF_HOST]:
+            return None
+        assert config_entry.unique_id is not None
+        unique_id = next(
+            (
+                site_id
+                for site_id, site in sites.items()
+                if site.name == config_entry.data[CONF_SITE_ID]
+                and site_ids_moved(config_entry.unique_id, site_id)
+            ),
+            None,
+        )
+        if (
+            unique_id is not None
+            and self.hass.config_entries.async_entry_for_domain_unique_id(
+                DOMAIN, unique_id
+            )
+        ):
+            raise AbortFlow("already_configured")
+        return unique_id
 
     @override
     async def async_step_integration_discovery(

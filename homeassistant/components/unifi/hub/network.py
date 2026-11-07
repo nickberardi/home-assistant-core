@@ -33,11 +33,6 @@ class NetworkPort(ApiItem):
         """Port index."""
         return self.raw["idx"]
 
-    @property
-    def poe_enabled(self) -> bool:
-        """Whether PoE is enabled on the port."""
-        return self.raw.get("poe", {}).get("enabled", False)
-
 
 class _DerivedHandler[ItemT: ApiItem](APIHandler[ItemT]):
     """Handler filled from per device requests instead of a list endpoint."""
@@ -123,7 +118,13 @@ class NetworkPorts(_DerivedHandler[NetworkPort]):
             for mac, device in self.devices.items()
             if mac not in self._ports and device.supported
         ]
-        details = await self._fetch_per_device(new, self.devices.get_details)
+        try:
+            details = await self._fetch_per_device(new, self.devices.get_details)
+        except TimeoutError, aiounifi.AiounifiException:
+            # Known ports stay usable, the new devices are tried again
+            if not self._ports:
+                raise
+            details = {}
         for mac, device in details.items():
             self._ports[mac] = [port for port in device.ports if "poe" in port]
         self.reconcile(

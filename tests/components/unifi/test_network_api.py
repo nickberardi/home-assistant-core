@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 import aiohttp
+import aiounifi
 from freezegun.api import FrozenDateTimeFactory
 import pytest
 from pytest_homeassistant.common import (
@@ -624,3 +625,104 @@ async def test_rejected_key_while_polling_starts_reauth(
         await hass.async_block_till_done(wait_background_tasks=True)
 
     assert any(network_config_entry_setup.async_get_active_flows(hass, {SOURCE_REAUTH}))
+
+
+@pytest.mark.parametrize(
+    ("side_effect", "state", "reauth"),
+    [
+        (aiounifi.RequestError, ConfigEntryState.SETUP_RETRY, False),
+        (aiounifi.Unauthorized, ConfigEntryState.SETUP_ERROR, True),
+    ],
+    ids=["unavailable", "rejected_key"],
+)
+async def test_assign_site_fails(
+    hass: HomeAssistant,
+    network_config_entry_factory: ConfigEntryFactoryType,
+    side_effect: type[Exception],
+    state: ConfigEntryState,
+    reauth: bool,
+) -> None:
+    """A site that cannot be assigned is retried or asks for a new key."""
+    with patch(
+        "aiounifi.network.v1.api_client.ApiClient.assign_site", side_effect=side_effect
+    ):
+        config_entry = await network_config_entry_factory()
+
+    assert config_entry.state is state
+    assert any(config_entry.async_get_active_flows(hass, {SOURCE_REAUTH})) is reauth
+
+
+@pytest.mark.usefixtures("network_config_entry_setup")
+async def test_new_device_failing_keeps_known_ports(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    mock_network_requests: Callable[[], None],
+) -> None:
+    """Details of a new device that fail leave the known ports usable."""
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{SITE_URL}/devices", json=network_page([SWITCH, ACCESS_POINT]))
+    aioclient_mock.get(f"{SITE_URL}/devices/{ACCESS_POINT_ID}", status=500)
+    aioclient_mock.get(
+        f"{SITE_URL}/devices/{ACCESS_POINT_ID}/statistics/latest", json={}
+    )
+    mock_network_requests()
+    # The device list lists the new device before its ports are fetched
+    for seconds in (11, 61):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds))
+        await hass.async_block_till_done()
+
+    assert hass.states.get(POWER_CYCLE_BUTTON).state == STATE_UNKNOWN
+
+
+async def test_unsupported_device(
+    hass: HomeAssistant,
+    network_config_entry_factory: ConfigEntryFactoryType,
+    network_device_payload: list[dict[str, Any]],
+    network_device_details_payload: dict[str, dict[str, Any]],
+) -> None:
+    """A device the Integration API does not support gets no entities."""
+    network_device_payload[:] = [{**SWITCH, "supported": False}]
+    network_device_details_payload.clear()
+
+    await network_config_entry_factory()
+
+    assert hass.states.get(RESTART_BUTTON) is None
+    assert hass.states.get("sensor.switch_state") is None
+
+
+@pytest.mark.usefixtures("network_config_entry_setup")
+async def test_statistics_poll_between_device_polls(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    mock_network_requests: Callable[[], None],
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Device polls in between do not hold statistics back."""
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(
+        f"{SITE_URL}/devices/{SWITCH_ID}/statistics/latest",
+        json={**SWITCH_STATISTICS, "cpuUtilizationPct": 50.0},
+    )
+    mock_network_requests()
+    for _ in range(7):
+        freezer.tick(timedelta(seconds=10))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.switch_cpu_utilization").state == "50.0"
+
+
+async def test_ports_of_only_device_fail(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    network_config_entry_factory: ConfigEntryFactoryType,
+    network_device_details_payload: dict[str, dict[str, Any]],
+) -> None:
+    """A device whose details fail still gets its other entities."""
+    network_device_details_payload.clear()
+    aioclient_mock.get(f"{SITE_URL}/devices/{SWITCH_ID}", status=500)
+
+    await network_config_entry_factory()
+
+    assert hass.states.get(POWER_CYCLE_BUTTON) is None
+    assert hass.states.get(RESTART_BUTTON) is not None

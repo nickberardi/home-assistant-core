@@ -144,6 +144,12 @@ def async_network_device_available_fn(hub: UnifiHub, obj_id: str) -> bool:
 
 
 @callback
+def async_network_device_supported_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if the Integration API supports a device."""
+    return hub.api.network.devices[obj_id.partition("_")[0]].supported
+
+
+@callback
 def async_network_device_device_info_fn(hub: UnifiHub, obj_id: str) -> DeviceInfo:
     """Create device registry entry for a device of the Integration API."""
     device = hub.api.network.devices[obj_id.partition("_")[0]]

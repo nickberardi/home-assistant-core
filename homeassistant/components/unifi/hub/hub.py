@@ -11,7 +11,11 @@ import aiounifi
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.const import Platform
 from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import (
     DeviceEntry,
@@ -42,6 +46,34 @@ if TYPE_CHECKING:
 
 OBJECT_ID = re.compile(r"[0-9a-f]{24}")
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def site_ids_moved(old_id: str, new_id: str) -> bool:
+    """Return if two IDs can be the same site in either API.
+
+    Consoles older than UniFi Network 11 give a site an ObjectId in the local
+    user API, the Integration API always gives it a UUID.
+    """
+    return bool(
+        (OBJECT_ID.fullmatch(old_id) and UUID.fullmatch(new_id))
+        or (UUID.fullmatch(old_id) and OBJECT_ID.fullmatch(new_id))
+    )
+
+
+@callback
+def async_move_site_devices(
+    hass: HomeAssistant, entry_id: str, old_id: str, new_id: str
+) -> None:
+    """Move the devices of the UniFi Network application to a new site ID."""
+    device_registry = dr.async_get(hass)
+    for domain in (DOMAIN, SWITCH_DOMAIN):
+        device = device_registry.async_get_device_by_identifier(
+            (domain, old_id), entry_id
+        )
+        if device:
+            device_registry.async_update_device(
+                device.id, new_identifiers={(domain, new_id)}
+            )
 
 
 class UnifiHub:
@@ -179,7 +211,13 @@ class UnifiHub:
             raise ConfigEntryError(
                 translation_domain=DOMAIN, translation_key="site_not_found"
             )
-        await network.assign_site(unique_id)
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                await network.assign_site(unique_id)
+        except (aiounifi.Forbidden, aiounifi.Unauthorized) as err:
+            raise ConfigEntryAuthFailed from err
+        except (TimeoutError, aiounifi.AiounifiException) as err:
+            raise ConfigEntryNotReady("UniFi site is not available") from err
         # Only an administrator can create an API key
         self.is_admin = True
         with suppress(TimeoutError, aiounifi.AiounifiException):
@@ -214,15 +252,7 @@ class UnifiHub:
             return old_id
 
         LOGGER.info("UniFi site %s changed ID from %s to %s", self.site, old_id, new_id)
-        device_registry = dr.async_get(self.hass)
-        for domain in (DOMAIN, SWITCH_DOMAIN):
-            device = device_registry.async_get_device_by_identifier(
-                (domain, old_id), self.config.entry.entry_id
-            )
-            if device:
-                device_registry.async_update_device(
-                    device.id, new_identifiers={(domain, new_id)}
-                )
+        async_move_site_devices(self.hass, self.config.entry.entry_id, old_id, new_id)
         self.hass.config_entries.async_update_entry(self.config.entry, unique_id=new_id)
         return new_id
 

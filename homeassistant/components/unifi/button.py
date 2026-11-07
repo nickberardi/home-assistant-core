@@ -45,6 +45,7 @@ from .entity import (
     async_device_supported_fn,
     async_network_device_available_fn,
     async_network_device_device_info_fn,
+    async_network_device_supported_fn,
     async_port_poe_supported_fn,
     async_wlan_available_fn,
     async_wlan_device_info_fn,
@@ -167,13 +168,6 @@ def make_network_api_descriptions(
     Ports are kept by the hub, the API lists no ports of its own.
     """
 
-    @callback
-    def port_available_fn(hub: UnifiHub, obj_id: str) -> bool:
-        return (
-            async_network_device_available_fn(hub, obj_id)
-            and hub.network_ports[obj_id].poe_enabled
-        )
-
     return (
         UnifiButtonEntityDescription[NetworkDevices, NetworkDevice](
             key="Device restart",
@@ -184,6 +178,7 @@ def make_network_api_descriptions(
             control_fn=async_network_restart_device_control_fn,
             device_info_fn=async_network_device_device_info_fn,
             object_fn=lambda api, obj_id: api.network.devices[obj_id],
+            supported_fn=async_network_device_supported_fn,
             unique_id_fn=lambda hub, obj_id: f"device_restart-{obj_id}",
         ),
         UnifiButtonEntityDescription[NetworkPorts, NetworkPort](
@@ -192,7 +187,7 @@ def make_network_api_descriptions(
             entity_category=EntityCategory.CONFIG,
             device_class=ButtonDeviceClass.RESTART,
             api_handler_fn=lambda _: hub.network_ports,
-            available_fn=port_available_fn,
+            available_fn=async_network_device_available_fn,
             control_fn=async_network_power_cycle_port_control_fn,
             device_info_fn=async_network_device_device_info_fn,
             object_fn=lambda _, obj_id: hub.network_ports[obj_id],

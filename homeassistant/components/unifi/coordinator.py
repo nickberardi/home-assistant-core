@@ -66,9 +66,8 @@ class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
 
         A fixed update interval is kept whether the handler has items or not.
         """
-        supports_websocket = bool(
-            getattr(handler, "process_messages", None)
-            or getattr(handler, "remove_messages", None)
+        supports_websocket = not isinstance(handler, NetworkApiHandler) and bool(
+            handler.process_messages or handler.remove_messages
         )
         super().__init__(
             hub.hass,
@@ -180,8 +179,16 @@ class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
 
     @callback
     def _async_handle_update(self, event: ItemEvent, obj_id: str) -> None:
-        """Notify listeners which object changed on a websocket update."""
-        self.async_set_updated_data((event, obj_id))
+        """Notify listeners which object changed.
+
+        A polled handler can also signal between its polls, which must not
+        push its next poll back.
+        """
+        if self._supports_websocket:
+            self.async_set_updated_data((event, obj_id))
+            return
+        self.data = (event, obj_id)
+        self.async_update_listeners()
 
     @callback
     @override

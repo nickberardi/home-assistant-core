@@ -46,6 +46,7 @@ from .entity import (
     async_device_supported_fn,
     async_network_client_device_info_fn,
     async_network_device_device_info_fn,
+    async_network_device_supported_fn,
     is_locally_administered_mac,
 )
 from .hub import UnifiHub
@@ -257,6 +258,7 @@ NETWORK_API_ENTITY_DESCRIPTIONS: tuple[UnifiTrackerEntityDescription, ...] = (
             hub.api.network.devices[obj_id].state is NetworkDeviceState.ONLINE
         ),
         object_fn=lambda api, obj_id: api.network.devices[obj_id],
+        supported_fn=async_network_device_supported_fn,
         unique_id_fn=lambda hub, obj_id: obj_id,
         ip_address_fn=lambda api, obj_id: api.network.devices[obj_id].ip_address,
         hostname_fn=lambda api, obj_id: None,
