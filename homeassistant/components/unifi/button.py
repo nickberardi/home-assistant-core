@@ -163,10 +163,7 @@ ENTITY_DESCRIPTIONS: tuple[UnifiButtonEntityDescription, ...] = (
 def make_network_api_descriptions(
     hub: UnifiHub,
 ) -> tuple[UnifiButtonEntityDescription, ...]:
-    """Describe the buttons of the Integration API.
-
-    Ports are kept by the hub, the API lists no ports of its own.
-    """
+    """Describe the buttons of the Integration API."""
 
     return (
         UnifiButtonEntityDescription[NetworkDevices, NetworkDevice](

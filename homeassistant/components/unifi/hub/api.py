@@ -68,25 +68,18 @@ async def get_unifi_api(
 
     try:
         async with asyncio.timeout(10):
-            if api_key_only:
-                await api.network.get_info()
-            else:
+            if not api_key_only:
                 await api.login()
-
-    except aiounifi.EndpointNotFound as err:
-        if not api_key_only:
-            LOGGER.error(
-                "Error connecting to the UniFi Network at %s: %s",
-                config[CONF_HOST],
-                err,
-            )
-            raise CannotConnect from err
-        LOGGER.error(
-            "UniFi Network at %s does not offer the Integration API: %s",
-            config[CONF_HOST],
-            err,
-        )
-        raise NetworkApiUnavailable from err
+            else:
+                try:
+                    await api.network.get_info()
+                except aiounifi.EndpointNotFound as err:
+                    LOGGER.error(
+                        "UniFi Network at %s does not offer the Integration API: %s",
+                        config[CONF_HOST],
+                        err,
+                    )
+                    raise NetworkApiUnavailable from err
 
     except aiounifi.TwoFaTokenRequired as err:
         LOGGER.warning(

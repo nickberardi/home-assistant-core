@@ -128,9 +128,6 @@ def _async_network_api_diagnostics(config_entry: UnifiConfigEntry) -> dict[str, 
         for counter, mac in enumerate(chain(network.clients, network.devices))
     }
 
-    def redact(raw: Mapping[str, Any]) -> dict[str, Any]:
-        return async_replace_dict_data(raw, macs_to_redact)
-
     return {
         "config": async_redact_data(
             async_replace_dict_data(config_entry.as_dict(), macs_to_redact),
@@ -138,21 +135,21 @@ def _async_network_api_diagnostics(config_entry: UnifiConfigEntry) -> dict[str, 
         ),
         "network_version": hub.network_version,
         "clients": {
-            macs_to_redact[mac]: redact(client.raw)
+            macs_to_redact[mac]: async_replace_dict_data(client.raw, macs_to_redact)
             for mac, client in network.clients.items()
         },
         "devices": {
-            macs_to_redact[mac]: redact(device.raw)
+            macs_to_redact[mac]: async_replace_dict_data(device.raw, macs_to_redact)
             for mac, device in network.devices.items()
         },
         "ports": {
-            f"{macs_to_redact.get(obj_id.partition('_')[0], REDACTED)}_{port.idx}": (
-                redact(port.raw)
+            f"{macs_to_redact[obj_id.partition('_')[0]]}_{port.idx}": (
+                async_replace_dict_data(port.raw, macs_to_redact)
             )
             for obj_id, port in hub.network_ports.items()
         },
         "statistics": {
-            macs_to_redact.get(mac, REDACTED): redact(statistics.raw)
+            macs_to_redact[mac]: async_replace_dict_data(statistics.raw, macs_to_redact)
             for mac, statistics in hub.network_statistics.items()
         },
     }

@@ -48,11 +48,7 @@ class _DerivedHandler[ItemT: ApiItem](APIHandler[ItemT]):
         )
 
     def _device_changed(self, event: ItemEvent, mac: str) -> None:
-        """Follow the device the objects belong to, which is polled more often.
-
-        Objects of a removed device are dropped, the others are signalled as
-        their availability follows the device state.
-        """
+        """Drop the objects of a removed device, signal the others' availability."""
         for obj_id in [obj_id for obj_id in self if obj_id.partition("_")[0] == mac]:
             if event is ItemEvent.DELETED:
                 self._forget(obj_id)
@@ -67,11 +63,7 @@ class _DerivedHandler[ItemT: ApiItem](APIHandler[ItemT]):
     async def _fetch_per_device[T](
         self, macs: list[str], fetch: Callable[[str], Awaitable[T]]
     ) -> dict[str, T]:
-        """Fetch data of each device with a few requests in flight.
-
-        A device can fail on its own, for example when it was just removed,
-        so only a failure of every request is raised.
-        """
+        """Fetch data per device, raise only if every request failed."""
         semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
 
         async def fetch_one(mac: str) -> T:
@@ -87,7 +79,8 @@ class _DerivedHandler[ItemT: ApiItem](APIHandler[ItemT]):
             if isinstance(result, BaseException):
                 LOGGER.debug("Could not fetch UniFi device %s data: %r", mac, result)
                 errors.append(result)
-            else:
+            # The device can be removed while its request is in flight
+            elif mac in self.devices:
                 fetched[mac] = result
         if errors and not fetched:
             raise errors[0]
@@ -95,11 +88,7 @@ class _DerivedHandler[ItemT: ApiItem](APIHandler[ItemT]):
 
 
 class NetworkPorts(_DerivedHandler[NetworkPort]):
-    """PoE capable ports of the adopted devices.
-
-    Ports only change with the hardware, so the details of each device are
-    fetched once.
-    """
+    """PoE capable ports, fetched once per device as they change with hardware."""
 
     item_cls = NetworkPort
 
@@ -137,11 +126,7 @@ class NetworkPorts(_DerivedHandler[NetworkPort]):
 
 
 class NetworkStatistics(_DerivedHandler[DeviceStatistics]):
-    """Latest statistics of the online devices.
-
-    A device that goes offline keeps its last statistics, its sensors tell
-    from the device state that they are not current.
-    """
+    """Latest statistics of the online devices, kept while a device is offline."""
 
     item_cls = DeviceStatistics
     keep_missing = True

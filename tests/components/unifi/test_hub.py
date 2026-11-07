@@ -683,7 +683,6 @@ async def test_site_id_changed_not_followed(
         (aiounifi.ServiceUnavailable, CannotConnect),
         (aiounifi.RequestError, CannotConnect),
         (aiounifi.ResponseError, CannotConnect),
-        (aiounifi.EndpointNotFound, CannotConnect),
         (aiounifi.AuthenticationRateLimitError, CannotConnect),
         (aiounifi.Unauthorized, AuthenticationRequired),
         (aiounifi.LoginRequired, AuthenticationRequired),

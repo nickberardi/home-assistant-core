@@ -63,7 +63,8 @@ async def async_setup_entry(
     hub.async_update_device_registry()
     hub.entity_loader.load_entities()
 
-    hub.websocket.start()
+    if not hub.config.api_key_only:
+        hub.websocket.start()
 
     config_entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, hub.shutdown)

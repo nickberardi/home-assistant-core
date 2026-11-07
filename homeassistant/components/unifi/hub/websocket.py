@@ -8,7 +8,6 @@ import aiounifi
 from homeassistant.core import callback
 
 from ..const import LOGGER
-from .config import entry_is_api_key_only
 from .connection import UnifiConnectionManager
 
 
@@ -26,12 +25,7 @@ class UnifiWebsocket:
 
     @callback
     def start(self) -> None:
-        """Start websocket handler.
-
-        The Integration API has no websocket, its data is polled.
-        """
-        if entry_is_api_key_only(self.connection.config_entry.data):
-            return
+        """Start websocket handler."""
         self.running = True
         self.start_websocket()
 

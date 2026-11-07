@@ -39,13 +39,6 @@ SESSION_CHECK_ERRORS = (
 )
 
 
-# An Integration API key is rejected on every endpoint alike
-API_KEY_SESSION_CHECK_ERRORS = (
-    *SESSION_CHECK_ERRORS,
-    aiounifi.Forbidden,
-    aiounifi.Unauthorized,
-)
-
 type UnifiApiHandler = APIHandler | NetworkApiHandler
 
 
@@ -62,10 +55,7 @@ class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
         disable_polling_on_endpoint_not_found: bool = False,
         update_interval: timedelta | None = None,
     ) -> None:
-        """Initialize coordinator.
-
-        A fixed update interval is kept whether the handler has items or not.
-        """
+        """Initialize coordinator, a given update interval stays fixed."""
         supports_websocket = not isinstance(handler, NetworkApiHandler) and bool(
             handler.process_messages or handler.remove_messages
         )
@@ -79,8 +69,9 @@ class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
             ),
         )
         self._fixed_update_interval = update_interval is not None
+        # An Integration API key is rejected on every endpoint alike
         self._session_check_errors = (
-            API_KEY_SESSION_CHECK_ERRORS
+            (*SESSION_CHECK_ERRORS, aiounifi.Forbidden, aiounifi.Unauthorized)
             if hub.config.api_key_only
             else SESSION_CHECK_ERRORS
         )
@@ -179,16 +170,14 @@ class UnifiDataUpdateCoordinator[HandlerT: UnifiApiHandler](
 
     @callback
     def _async_handle_update(self, event: ItemEvent, obj_id: str) -> None:
-        """Notify listeners which object changed.
-
-        A polled handler can also signal between its polls, which must not
-        push its next poll back.
-        """
-        if self._supports_websocket:
-            self.async_set_updated_data((event, obj_id))
+        """Notify listeners which object changed."""
+        if isinstance(self._handler, NetworkApiHandler):
+            # Integration API handlers signal between polls too, without
+            # pushing their next poll back
+            self.data = (event, obj_id)
+            self.async_update_listeners()
             return
-        self.data = (event, obj_id)
-        self.async_update_listeners()
+        self.async_set_updated_data((event, obj_id))
 
     @callback
     @override

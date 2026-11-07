@@ -212,19 +212,28 @@ class UnifiEntityLoader:
 
     @callback
     def _restore_network_clients(self) -> None:
-        """Keep the client trackers of clients that are not connected now.
+        """Keep enabled trackers of unlisted clients, prune disabled ones.
 
-        The Integration API only lists connected clients, so a tracked client
-        is restored from its registry entries until it connects again.
+        The Integration API only lists connected clients and keeps no history,
+        a disabled tracker is created again once its client connects.
         """
         clients = self.hub.api.network.clients
+        entity_registry = er.async_get(self.hub.hass)
         device_registry = dr.async_get(self.hub.hass)
-        for _, mac in self._client_trackers():
+        for entity_id, mac in self._client_trackers():
             if mac in clients:
                 continue
             device = device_registry.async_get_device_by_connection(
                 (dr.CONNECTION_NETWORK_MAC, mac), self.hub.config.entry.entry_id
             )
+            entry = entity_registry.async_get(entity_id)
+            if entry is not None and entry.disabled:
+                entity_registry.async_remove(entity_id)
+                if device is not None and not er.async_entries_for_device(
+                    entity_registry, device.id, include_disabled_entities=True
+                ):
+                    device_registry.async_remove_device(device.id)
+                continue
             clients.restore(
                 ClientData(
                     access={"type": ClientAccessType.DEFAULT},

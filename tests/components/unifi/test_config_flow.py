@@ -1098,6 +1098,12 @@ API_KEY_ENTRY_DATA = {
     CONF_SITE_ID: DEFAULT_SITE,
     CONF_CONNECTION_MODE: CONNECTION_MODE_API_KEY_ONLY,
 }
+SITE_OBJECT_ID = "5ba29dd4e3c58f026e9d7c38"
+OBJECT_ID_SITE_PAYLOAD = [
+    {"desc": "Site name", "name": DEFAULT_SITE, "role": "admin", "_id": SITE_OBJECT_ID}
+]
+
+
 LOCAL_USER_INPUT = {
     CONF_HOST: DEFAULT_HOST,
     CONF_USERNAME: "username",
@@ -1135,34 +1141,33 @@ async def test_api_key_flow(
 
 
 @pytest.mark.parametrize(
-    ("path", "status", "payload", "error"),
+    ("info_status", "sites_status", "sites_payload", "error"),
     [
-        pytest.param("info", 401, None, "faulty_credentials", id="rejected_key"),
+        pytest.param(401, 200, None, "faulty_credentials", id="rejected_key"),
         pytest.param(
-            "info", 404, None, "network_api_unavailable", id="no_integration_api"
+            404, 200, None, "network_api_unavailable", id="no_integration_api"
         ),
-        pytest.param("info", 503, None, "service_unavailable", id="unavailable"),
-        pytest.param("sites", 403, None, "faulty_credentials", id="sites_forbidden"),
-        pytest.param(
-            "sites", 200, network_page([]), "service_unavailable", id="no_sites"
-        ),
+        pytest.param(503, 200, None, "service_unavailable", id="unavailable"),
+        pytest.param(200, 403, None, "faulty_credentials", id="sites_forbidden"),
+        pytest.param(200, 200, network_page([]), "service_unavailable", id="no_sites"),
     ],
 )
 async def test_api_key_flow_fails_and_recovers(
     hass: HomeAssistant,
     aioclient_mock: AiohttpClientMocker,
     mock_network_requests: Callable[[], None],
-    path: str,
-    status: int,
-    payload: dict[str, Any] | None,
+    info_status: int,
+    sites_status: int,
+    sites_payload: dict[str, Any] | None,
     error: str,
 ) -> None:
     """Test setting up with an API key recovers from errors."""
     result = await _start_user_flow(hass, "api_key")
 
-    if path != "info":
-        aioclient_mock.get(f"{NETWORK_URL}/info", json={"applicationVersion": "10"})
-    aioclient_mock.get(f"{NETWORK_URL}/{path}", status=status, json=payload)
+    aioclient_mock.get(
+        f"{NETWORK_URL}/info", status=info_status, json={"applicationVersion": "10"}
+    )
+    aioclient_mock.get(f"{NETWORK_URL}/sites", status=sites_status, json=sites_payload)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], user_input=API_KEY_INPUT
     )
@@ -1180,11 +1185,26 @@ async def test_api_key_flow_fails_and_recovers(
     assert result["data"] == API_KEY_ENTRY_DATA
 
 
-@pytest.mark.usefixtures("config_entry")
-async def test_api_key_flow_aborts_for_configured_site(
-    hass: HomeAssistant, mock_network_requests: Callable[[], None]
+@pytest.mark.parametrize(
+    ("unique_id", "expected_type"),
+    [
+        pytest.param(SITE_OBJECT_ID, FlowResultType.ABORT, id="same_site"),
+        pytest.param("1", FlowResultType.CREATE_ENTRY, id="other_site"),
+    ],
+)
+async def test_api_key_flow_site_of_local_user_entry(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_network_requests: Callable[[], None],
+    unique_id: str,
+    expected_type: FlowResultType,
 ) -> None:
-    """Test a site set up with a local user, keyed by its ObjectId, is found."""
+    """Test only a local user entry keying the same site by ObjectId aborts.
+
+    An entry of another console at the same address can have a site of the
+    same name.
+    """
+    hass.config_entries.async_update_entry(config_entry, unique_id=unique_id)
     mock_network_requests()
     result = await _start_user_flow(hass, "api_key")
 
@@ -1192,8 +1212,7 @@ async def test_api_key_flow_aborts_for_configured_site(
         result["flow_id"], user_input=API_KEY_INPUT
     )
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "already_configured"
+    assert result["type"] is expected_type
 
 
 async def test_reauth_api_key(
@@ -1220,23 +1239,20 @@ async def test_reauth_api_key(
 
     aioclient_mock.clear_requests()
     mock_network_requests()
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], user_input={CONF_API_KEY: "new_key"}
-    )
-    await hass.async_block_till_done()
+    with patch.object(hass.config_entries, "async_schedule_reload") as mock_reload:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input={CONF_API_KEY: "new_key"}
+        )
+        await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
+    # The update listener reloads the loaded entry, once
+    mock_reload.assert_called_once_with(network_config_entry_setup.entry_id)
     assert network_config_entry_setup.data == {
         **API_KEY_ENTRY_DATA,
         CONF_API_KEY: "new_key",
     }
-
-
-SITE_OBJECT_ID = "5ba29dd4e3c58f026e9d7c38"
-OBJECT_ID_SITE_PAYLOAD = [
-    {"desc": "Site name", "name": DEFAULT_SITE, "role": "admin", "_id": SITE_OBJECT_ID}
-]
 
 
 @pytest.mark.parametrize("site_payload", [OBJECT_ID_SITE_PAYLOAD])
@@ -1308,6 +1324,9 @@ async def test_reconfigure_to_local_user(
     assert network_config_entry_setup.state is ConfigEntryState.LOADED
     assert device_registry.async_get_device_by_identifier(
         (DOMAIN, SITE_OBJECT_ID), network_config_entry_setup.entry_id
+    )
+    assert not device_registry.async_get_device_by_identifier(
+        (DOMAIN, NETWORK_SITE_ID), network_config_entry_setup.entry_id
     )
 
 
@@ -1399,3 +1418,64 @@ async def test_reconfigure_api_key_unknown_site(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "unknown_site_id"
     assert network_config_entry_setup.unique_id == NETWORK_SITE_ID
+
+
+async def test_api_key_flow_multiple_sites(
+    hass: HomeAssistant,
+    mock_network_requests: Callable[[], None],
+    network_site_payload: list[dict[str, Any]],
+) -> None:
+    """Test an API key that sees several sites asks which one to set up."""
+    network_site_payload.append(
+        {"id": "other-site", "internalReference": "other", "name": "Other"}
+    )
+    mock_network_requests()
+    result = await _start_user_flow(hass, "api_key")
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input=API_KEY_INPUT
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "site"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], user_input={CONF_SITE_ID: "other-site"}
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Other"
+    assert result["data"] == {**API_KEY_ENTRY_DATA, CONF_SITE_ID: "other"}
+    assert result["result"].unique_id == "other-site"
+
+
+async def test_flow_integration_discovery_matches_api_key_console(
+    hass: HomeAssistant,
+    network_device_payload: list[dict[str, Any]],
+    network_config_entry_factory: ConfigEntryFactoryType,
+) -> None:
+    """Test discovery finds a console that an API key entry lists."""
+    network_device_payload.append(
+        {
+            "id": "4ff3bc5f-6d39-3d2e-9bfd-0f2bf6c3f1d4",
+            "macAddress": INTEGRATION_DISCOVERY_INFO["hw_addr"],
+            "model": "UDM Pro",
+            "name": "Console",
+            "state": "ONLINE",
+            "supported": True,
+        }
+    )
+    await network_config_entry_factory()
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={
+            **INTEGRATION_DISCOVERY_INFO,
+            "source_ip": "192.168.80.1",
+            "direct_connect_domain": None,
+        },
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"

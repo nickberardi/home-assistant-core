@@ -7,7 +7,7 @@ Configuration of options through options flow.
 """
 
 import asyncio
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 import json
 import operator
@@ -17,7 +17,6 @@ from typing import Any, NamedTuple, override
 
 import aiounifi
 from aiounifi.interfaces.sites import Sites
-from aiounifi.network.v1.interfaces.sites import Sites as NetworkSites
 import probatio
 
 from homeassistant.config_entries import (
@@ -82,12 +81,10 @@ API_KEY_DOCUMENTATION_URL = "https://www.home-assistant.io/integrations/unifi/#a
 
 
 class SiteChoice(NamedTuple):
-    """A site to set up."""
+    """A site to set up, by its short name and display name."""
 
     name: str
-    """Short name of the site, the same in both APIs."""
     title: str
-    """Display name of the site."""
 
 
 class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
@@ -163,7 +160,7 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
             )
 
             with _catch_unifi_api_flow_errors(errors):
-                self.sites = await self._async_update_network_sites(self.config)
+                self.sites = await self._async_update_sites(self.config)
                 return await self.async_step_site()
         else:
             data_schema = self._build_api_key_schema(
@@ -191,11 +188,15 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
 
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
-            # An entry of a console older than UniFi Network 11 keys the
-            # same site by its ObjectId
-            self._async_abort_entries_match(
-                {CONF_HOST: self.config[CONF_HOST], CONF_SITE_ID: site.name}
-            )
+            # The other API can key the same site by ObjectId instead of UUID
+            for entry in self._async_current_entries(include_ignore=False):
+                if (
+                    entry.data.get(CONF_HOST) == self.config[CONF_HOST]
+                    and entry.data.get(CONF_SITE_ID) == site.name
+                    and entry.unique_id is not None
+                    and site_ids_moved(entry.unique_id, unique_id)
+                ):
+                    return self.async_abort(reason="already_configured")
 
             return self.async_create_entry(title=site.title, data=self.config)
 
@@ -213,11 +214,7 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
-        """Trigger a reauthentication flow.
-
-        Only the credentials of the current mode are renewed, switching the
-        mode belongs to reconfigure.
-        """
+        """Renew the credentials of the entry's mode."""
         reauth_entry = self._get_reauth_entry()
         self.context["title_placeholders"] = {
             "host": reauth_entry.data[CONF_HOST],
@@ -239,7 +236,7 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
             data = {**reauth_entry.data, CONF_API_KEY: user_input[CONF_API_KEY]}
             with _catch_unifi_api_flow_errors(errors):
                 await get_unifi_api(self.hass, MappingProxyType(data))
-                return self.async_update_reload_and_abort(reauth_entry, data=data)
+                return self._async_store_entry(reauth_entry, data)
 
         return self.async_show_form(
             step_id="reauth_api_key",
@@ -306,7 +303,10 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             config_data = _api_key_config_from_input(
-                {CONF_API_KEY: stored_api_key, **user_input}
+                {
+                    **user_input,
+                    CONF_API_KEY: user_input.get(CONF_API_KEY) or stored_api_key,
+                }
             )
             data_schema = self._build_api_key_schema(
                 config_data[CONF_HOST],
@@ -316,7 +316,7 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
             )
 
             with _catch_unifi_api_flow_errors(errors):
-                sites = await self._async_update_network_sites(config_data)
+                sites = await self._async_update_sites(config_data)
                 return self._async_update_entry(config_entry, config_data, sites)
         else:
             data_schema = self._build_api_key_schema(
@@ -342,16 +342,14 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         config_data: dict[str, Any],
         sites: dict[str, SiteChoice],
     ) -> ConfigFlowResult:
-        """Store validated connection data and the site it resolves to.
-
-        The site is matched by unique ID, or by name when the other API keys
-        it differently, which then becomes the unique ID.
-        """
+        """Store validated connection data and the site it resolves to."""
         old_id = config_entry.unique_id
         assert old_id is not None
         unique_id: str | None = old_id
         if unique_id not in sites:
-            unique_id = self._async_match_moved_site(config_entry, config_data, sites)
+            unique_id = self._async_match_moved_site(
+                config_entry, old_id, config_data, sites
+            )
         if unique_id is None:
             raise AbortFlow("unknown_site_id")
         if unique_id != old_id:
@@ -362,8 +360,19 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         if not entry_is_api_key_only(config_data):
             data.pop(CONF_CONNECTION_MODE, None)
 
+        return self._async_store_entry(config_entry, data, unique_id)
+
+    @callback
+    def _async_store_entry(
+        self,
+        config_entry: UnifiConfigEntry,
+        data: dict[str, Any],
+        unique_id: str | None = None,
+    ) -> ConfigFlowResult:
+        """Update the entry and reload it, through the update listener when loaded."""
+        unique_id = unique_id or config_entry.unique_id
         if config_entry.state is ConfigEntryState.LOADED:
-            # The update listener reloads a loaded entry on data changes
+            # The update listener only reloads on data changes
             if data == config_entry.data:
                 self.hass.config_entries.async_schedule_reload(config_entry.entry_id)
             return self.async_update_and_abort(
@@ -377,23 +386,19 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     def _async_match_moved_site(
         self,
         config_entry: UnifiConfigEntry,
+        old_id: str,
         config_data: dict[str, Any],
         sites: dict[str, SiteChoice],
     ) -> str | None:
-        """Find the site of the entry in the API that keys it differently.
-
-        Only on the same host, as nearly every console has a site of the
-        same name.
-        """
+        """Find the site the other API keys differently, only on the same host."""
         if config_data[CONF_HOST] != config_entry.data[CONF_HOST]:
             return None
-        assert config_entry.unique_id is not None
         unique_id = next(
             (
                 site_id
                 for site_id, site in sites.items()
                 if site.name == config_entry.data[CONF_SITE_ID]
-                and site_ids_moved(config_entry.unique_id, site_id)
+                and site_ids_moved(old_id, site_id)
             ),
             None,
         )
@@ -509,31 +514,46 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
     async def _async_update_sites(
         self, data: Mapping[str, Any]
     ) -> dict[str, SiteChoice]:
-        """Get updated sites through UniFi API."""
+        """Get updated sites through the API of the connection mode."""
         hub = await get_unifi_api(self.hass, MappingProxyType(data))
-        return await _async_fetch_sites(
-            data,
-            hub.sites,
-            lambda: {
+        sites = hub.network.sites if entry_is_api_key_only(data) else hub.sites
+        try:
+            async with asyncio.timeout(SITE_REQUEST_TIMEOUT):
+                await sites.update()
+        except (
+            aiounifi.Forbidden,
+            aiounifi.LoginRequired,
+            aiounifi.NoPermission,
+            aiounifi.Unauthorized,
+        ) as err:
+            LOGGER.warning(
+                "UniFi Network at %s rejected the site request: %s",
+                data[CONF_HOST],
+                type(err).__name__,
+            )
+            raise AuthenticationRequired from err
+        # aiounifi 97 does not wrap JSON decode errors, newer releases do
+        except (TimeoutError, json.JSONDecodeError, aiounifi.AiounifiException) as err:
+            LOGGER.warning(
+                "Error fetching sites from UniFi Network at %s: %r",
+                data[CONF_HOST],
+                err,
+            )
+            raise CannotConnect from err
+        if not sites.values():
+            # aiounifi 97 returns no sites when the console answers with HTML,
+            # as it does while the Network application is missing or starting
+            LOGGER.warning("No sites found on UniFi Network at %s", data[CONF_HOST])
+            raise CannotConnect
+        if isinstance(sites, Sites):
+            return {
                 site.site_id: SiteChoice(site.name, site.description)
-                for site in hub.sites.values()
-            },
-        )
-
-    async def _async_update_network_sites(
-        self, data: Mapping[str, Any]
-    ) -> dict[str, SiteChoice]:
-        """Get updated sites through the Integration API."""
-        hub = await get_unifi_api(self.hass, MappingProxyType(data))
-        sites = hub.network.sites
-        return await _async_fetch_sites(
-            data,
-            sites,
-            lambda: {
-                site.site_id: SiteChoice(site.internal_reference, site.name)
                 for site in sites.values()
-            },
-        )
+            }
+        return {
+            site.site_id: SiteChoice(site.internal_reference, site.name)
+            for site in sites.values()
+        }
 
     @callback
     def _get_reauth_or_reconfigure_entry(self) -> UnifiConfigEntry:
@@ -733,43 +753,6 @@ async def _async_discover_unifi(hass: HomeAssistant) -> str | None:
         return await hass.async_add_executor_job(socket.gethostbyname, "unifi")
     except socket.gaierror:
         return None
-
-
-async def _async_fetch_sites(
-    data: Mapping[str, Any],
-    sites: Sites | NetworkSites,
-    site_choices: Callable[[], dict[str, SiteChoice]],
-) -> dict[str, SiteChoice]:
-    """Fetch the sites of the console and return the ones to choose from."""
-    try:
-        async with asyncio.timeout(SITE_REQUEST_TIMEOUT):
-            await sites.update()
-    except (
-        aiounifi.Forbidden,
-        aiounifi.LoginRequired,
-        aiounifi.NoPermission,
-        aiounifi.Unauthorized,
-    ) as err:
-        LOGGER.warning(
-            "UniFi Network at %s rejected the site request: %s",
-            data[CONF_HOST],
-            type(err).__name__,
-        )
-        raise AuthenticationRequired from err
-    # aiounifi 97 does not wrap JSON decode errors, newer releases do
-    except (TimeoutError, json.JSONDecodeError, aiounifi.AiounifiException) as err:
-        LOGGER.warning(
-            "Error fetching sites from UniFi Network at %s: %r",
-            data[CONF_HOST],
-            err,
-        )
-        raise CannotConnect from err
-    if not (choices := site_choices()):
-        # aiounifi 97 returns no sites when the console answers with HTML,
-        # as it does while the Network application is missing or starting
-        LOGGER.warning("No sites found on UniFi Network at %s", data[CONF_HOST])
-        raise CannotConnect
-    return choices
 
 
 def _api_key_config_from_input(user_input: dict[str, Any]) -> dict[str, Any]:

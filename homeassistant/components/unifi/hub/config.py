@@ -7,7 +7,6 @@ import ssl
 from typing import TYPE_CHECKING, Any, Literal, Self
 
 from homeassistant.const import (
-    CONF_API_KEY,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
@@ -63,7 +62,6 @@ class UnifiConfig:
     password: str
     site: str
     ssl_context: ssl.SSLContext | Literal[False]
-    api_key: str | None
     api_key_only: bool
     """Only the Integration API is used, there is no local user."""
 
@@ -114,7 +112,6 @@ class UnifiConfig:
             port=config[CONF_PORT],
             site=config[CONF_SITE_ID],
             ssl_context=config.get(CONF_VERIFY_SSL, False),
-            api_key=config.get(CONF_API_KEY),
             api_key_only=entry_is_api_key_only(config),
             option_supported_clients=options.get(CONF_CLIENT_SOURCE, []),
             option_track_clients=options.get(CONF_TRACK_CLIENTS, DEFAULT_TRACK_CLIENTS),

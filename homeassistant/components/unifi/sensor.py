@@ -1022,10 +1022,15 @@ def async_network_device_state_value_fn(
 def async_network_device_uptime_value_fn(
     hub: UnifiHub, statistics: DeviceStatistics
 ) -> datetime | None:
-    """Calculate the approximate time a device started."""
+    """Calculate the time a device started from when its statistics were sampled."""
     if not statistics.uptime_sec:
         return None
-    return (dt_util.now() - timedelta(seconds=statistics.uptime_sec)).replace(
+    sampled_at = (
+        dt_util.parse_datetime(statistics.last_heartbeat_at)
+        if statistics.last_heartbeat_at
+        else None
+    ) or dt_util.now()
+    return (sampled_at - timedelta(seconds=statistics.uptime_sec)).replace(
         microsecond=0
     )
 
@@ -1034,10 +1039,7 @@ def async_network_device_uptime_value_fn(
 def make_network_api_descriptions(
     hub: UnifiHub,
 ) -> tuple[UnifiSensorEntityDescription, ...]:
-    """Describe the sensors of the Integration API.
-
-    Statistics are kept by the hub, the API lists them per device.
-    """
+    """Describe the sensors of the Integration API."""
     return (
         UnifiSensorEntityDescription[NetworkDevices, NetworkDevice](
             key="Integration API device state",

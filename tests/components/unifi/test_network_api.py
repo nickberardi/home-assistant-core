@@ -16,10 +16,14 @@ from pytest_homeassistant.common import (
     snapshot_platform,
 )
 from pytest_homeassistant.components.diagnostics import get_diagnostics_for_config_entry
-from pytest_homeassistant.test_util.aiohttp import AiohttpClientMocker
+from pytest_homeassistant.test_util.aiohttp import (
+    AiohttpClientMocker,
+    AiohttpClientMockResponse,
+)
 from pytest_homeassistant.typing import ClientSessionGenerator, WebSocketGenerator
 from syrupy.assertion import SnapshotAssertion
 from syrupy.filters import props
+from yarl import URL
 
 from homeassistant.components.button import DOMAIN as BUTTON_DOMAIN, SERVICE_PRESS
 from homeassistant.components.device_tracker import DOMAIN as TRACKER_DOMAIN
@@ -223,7 +227,7 @@ async def test_client_tracker_follows_polls(
         {CONF_TRACK_CLIENTS: False, CONF_TRACK_DEVICES: False},
         {CONF_TRACK_CLIENTS: False, CONF_CLIENT_SOURCE: [WIRED_CLIENT_MAC]},
     ],
-    ids=["no_wired_clients", "no_clients_or_devices", "selected_client"],
+    ids=["no_wired_clients", "no_clients_or_devices", "client_source_ignored"],
 )
 @pytest.mark.usefixtures("entity_registry_enabled_by_default")
 async def test_tracker_options(
@@ -260,6 +264,34 @@ async def test_restores_disconnected_client(
 
     assert hass.states.get(WIRELESS_TRACKER).state == STATE_NOT_HOME
     assert hass.states.get("device_tracker.desktop").state == STATE_HOME
+
+
+async def test_prunes_disabled_tracker_of_unlisted_client(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    device_registry: dr.DeviceRegistry,
+    network_config_entry: MockConfigEntry,
+    network_config_entry_factory: ConfigEntryFactoryType,
+) -> None:
+    """A disabled tracker of a client that is not connected is removed."""
+    mac = "00:00:00:00:00:03"
+    device = device_registry.async_get_or_create(
+        config_entry_id=network_config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, mac)},
+    )
+    entry = entity_registry.async_get_or_create(
+        Platform.DEVICE_TRACKER,
+        DOMAIN,
+        f"{DEFAULT_SITE}-{mac}",
+        config_entry=network_config_entry,
+        device_id=device.id,
+        disabled_by=er.RegistryEntryDisabler.INTEGRATION,
+    )
+
+    await network_config_entry_factory()
+
+    assert entity_registry.async_get(entry.entity_id) is None
+    assert device_registry.async_get(device.id) is None
 
 
 @pytest.mark.parametrize(
@@ -725,3 +757,40 @@ async def test_ports_of_only_device_fail(
 
     assert hass.states.get(POWER_CYCLE_BUTTON) is None
     assert hass.states.get(RESTART_BUTTON) is not None
+
+
+async def test_device_removed_while_statistics_are_fetched(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    mock_network_requests: Callable[[], None],
+    network_config_entry_setup: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Statistics of a device removed meanwhile are not stored."""
+    devices = network_config_entry_setup.runtime_data.api.network.devices
+
+    async def remove_device(
+        method: str, url: URL, data: Any
+    ) -> AiohttpClientMockResponse:
+        devices.reconcile([])
+        return AiohttpClientMockResponse(method, url, json=SWITCH_STATISTICS)
+
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(
+        f"{SITE_URL}/devices/{SWITCH_ID}/statistics/latest", side_effect=remove_device
+    )
+    mock_network_requests()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=61))
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert SWITCH_MAC not in network_config_entry_setup.runtime_data.network_statistics
+    assert hass.states.get("sensor.switch_cpu_utilization") is None
+    assert "Unexpected error" not in caplog.text
+
+
+@pytest.mark.freeze_time("2026-11-07 10:05:00+00:00")
+@pytest.mark.usefixtures("network_config_entry_setup")
+async def test_uptime_from_sample_time(hass: HomeAssistant) -> None:
+    """Uptime counts from when the statistics were sampled, not from now."""
+    # Sampled at 10:00 with an hour of uptime
+    assert hass.states.get("sensor.switch_uptime").state == "2026-11-07T09:00:00+00:00"

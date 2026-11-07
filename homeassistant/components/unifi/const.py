@@ -26,7 +26,6 @@ PLATFORMS = [
     Platform.UPDATE,
 ]
 
-# Only the forwarded platforms can be filled from the Integration API
 API_KEY_ONLY_PLATFORMS = [
     Platform.BUTTON,
     Platform.DEVICE_TRACKER,
